@@ -20,20 +20,20 @@ ANSWERS_DIR="${ANSWER_ROOT}/TextVQA/answers/cross_attention"
 ANSWER_FILE="${ANSWERS_DIR}/${REDISTRIBUTION_STRATEGY}_${REDISTRIBUTION_SOFTMAX_MODE}_${RETAINED_TOKENS}.jsonl"
 mkdir -p "${ANSWERS_DIR}"
 
-PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}" \
-CUDA_VISIBLE_DEVICES=${GPU_ID} python -m llava.eval.model_vqa_loader_cross \
-    --model-path ${CKPT} \
-    --question-file "${DATASET_DIR}/textvqa/llava_textvqa_val_v051_ocr.jsonl" \
-    --image-folder "${DATASET_DIR}/textvqa/train_images" \
-    --answers-file ${ANSWER_FILE} \
-    --temperature 0 \
-    --conv-mode vicuna_v1 \
-    --retained_tokens ${RETAINED_TOKENS} \
-    --redistribution_strategy ${REDISTRIBUTION_STRATEGY} \
-    --redistribution_softmax_mode ${REDISTRIBUTION_SOFTMAX_MODE} \
-    --receiver_token_count ${RECEIVER_TOKEN_COUNT}
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
+# CUDA_VISIBLE_DEVICES=${GPU_ID} python -m llava.eval.model_vqa_loader_cross \
+#     --model-path ${CKPT} \
+#     --question-file "${DATASET_DIR}/textvqa/llava_textvqa_val_v051_ocr.jsonl" \
+#     --image-folder "${DATASET_DIR}/textvqa/train_images" \
+#     --answers-file ${ANSWER_FILE} \
+#     --temperature 0 \
+#     --conv-mode vicuna_v1 \
+#     --retained_tokens ${RETAINED_TOKENS} \
+#     --redistribution_strategy ${REDISTRIBUTION_STRATEGY} \
+#     --redistribution_softmax_mode ${REDISTRIBUTION_SOFTMAX_MODE} \
+#     --receiver_token_count ${RECEIVER_TOKEN_COUNT}
 
-wait
+# wait
 
 python ${REPO_ROOT}/SparseVLMs/llava/eval/eval_textvqa.py \
     --annotation-file "${DATASET_DIR}/textvqa/TextVQA_0.5.1_val.json" \
