@@ -32,6 +32,9 @@ class sink_token_selector:
 
         # max over target dimensions for each token: shape [num_tokens]
         return torch.max(sink_candidates, dim=1).values
+    
+        # sum over target dimensions for each token: shape [num_tokens]
+        # return torch.sum(sink_candidates, dim=1)
 
     def resolve_sink_score_range(
         self,
