@@ -2,9 +2,6 @@
 
 *A training-free, plug-and-play method that detects sink tokens and redistributes their attention budget to text-relevant visual tokens for more reliable token pruning in multimodal large language models.*
 
-[![Code](https://img.shields.io/badge/Code-GitHub-181717?logo=github&logoColor=white)](https://github.com/intcomp/attention-bias)
-[![Paper](https://img.shields.io/badge/Paper-arXiv-red)](https://arxiv.org/abs/2508.17807v2)
-
 ## 👁️ Overview
 
 ![overview](assets/pipeline.png)
