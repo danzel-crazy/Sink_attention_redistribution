@@ -61,6 +61,40 @@ class PrefillDebugSnapshot:
     generated_query_token_ids: Optional[torch.Tensor] = None
     generated_query_token_strings: List[str] = field(default_factory=list)
     generated_query_visual_attentions: Optional[torch.Tensor] = None  # [num_generated_queries, image_token_length]
+    prune_layer_input_layernorm_weight: Optional[torch.Tensor] = None
+    prune_layer_input_layernorm_eps: Optional[float] = None
+
+    # --- three text->visual cross-attention variants over the visual block, each the mean over
+    # question-token rows (row_probabilities.mean(dim=1)), length == image_token_length. Computed
+    # at capture time by the real pipeline functions; used by cross_attention_visualize.py. ---
+    visual_cross_pre_visual: Optional[torch.Tensor] = None        # pre_visual_cross_attention (V_self)
+    visual_cross_text_to_visual: Optional[torch.Tensor] = None    # text_to_visual_attention (real weights)
+    visual_cross_from_qk: Optional[torch.Tensor] = None           # text_to_visual_attention_from_qk (raw Q/K)
+
+    # --- unmasked per-question-row probabilities for the same three variants. These let
+    # visualization code derive unmasked maps offline with row_probabilities.mean(dim=1).
+    # Sink-masked maps should prefer the logit/head-row fields below when present.
+    visual_cross_pre_visual_rows: Optional[torch.Tensor] = None        # [B, T, N]
+    visual_cross_text_to_visual_rows: Optional[torch.Tensor] = None    # [B, T, N]
+    visual_cross_from_qk_rows: Optional[torch.Tensor] = None           # [B, T, N]
+
+    # --- optional pre-head-average / pre-softmax tensors for sink-masked visualization.
+    # These support the masked design "mask logits, then softmax" offline. For the
+    # post-softmax weights path, storing per-head visual-restricted probabilities is enough:
+    # zero+renormalize per head is equivalent to setting masked visual logits to -inf before
+    # the visual-restricted softmax.
+    visual_cross_pre_visual_logits: Optional[torch.Tensor] = None       # [B, T, N]
+    visual_cross_text_to_visual_head_rows: Optional[torch.Tensor] = None  # [B, H, T, N]
+    visual_cross_from_qk_logits: Optional[torch.Tensor] = None          # [B, H, T, N]
+
+    # --- exact runtime redistribution bookkeeping from AttentionRedistributionResult.
+    # Older snapshots do not have these fields; visualization code can still derive coarse
+    # receiver/sink roles from visual_self_attention and visual_redistributed_attention.
+    receiver_indices: Optional[torch.Tensor] = None      # [num_receivers], local visual ids
+    receiver_weights: Optional[torch.Tensor] = None      # [num_receivers], normalized budget split
+    sink_budget: Optional[float] = None                  # sum of baseline_scores over runtime sinks
+    receiver_selection_scores: Optional[torch.Tensor] = None  # [N], scores used to select receivers
+    receiver_weight_scores: Optional[torch.Tensor] = None      # [N], scores used to weight receivers
 
 
 def save_snapshot(snapshot: PrefillDebugSnapshot, path: Union[str, Path]) -> Path:

@@ -17,31 +17,42 @@ RETAIN_TOKENS=$(python -c "print(round(${VISUAL_TOKEN_NUM} * (1 - ${FASTV_R})))"
 REDISTRIBUTION_STRATEGY=${REDISTRIBUTION_STRATEGY:="topk_text_visual_tokens"}
 REDISTRIBUTION_SOFTMAX_MODE=${REDISTRIBUTION_SOFTMAX_MODE:="resoftmax"}
 RECEIVER_TOKEN_COUNT=${RECEIVER_TOKEN_COUNT:=32}
+# How the freed sink budget splits among the selected receivers: "cross" (default) weights the split
+# by the cross-attention score, "uniform" gives each receiver an equal 1/RECEIVER_TOKEN_COUNT share.
+RECEIVER_WEIGHT_MODE=${RECEIVER_WEIGHT_MODE:="cross"}
+RECEIVER_IMPORTANCE_SOURCE=${RECEIVER_IMPORTANCE_SOURCE:="cross"}
 
 ANSWER_ROOT="/project/aimm/danzel/experiment/sink_masked/fastv"
 ANSWERS_DIR="${ANSWER_ROOT}/GQA/answers/cross_attention"
 EXP_NAME="${FASTV_K}_${FASTV_R}_${REDISTRIBUTION_STRATEGY}_${REDISTRIBUTION_SOFTMAX_MODE}_${RETAIN_TOKENS}_tokens"
+# Only non-default weight modes get a suffix, so the default run keeps writing to the same answer
+# file your existing GQA results already live in.
+if [ "${RECEIVER_WEIGHT_MODE}" != "cross" ]; then
+    EXP_NAME="${EXP_NAME}_weight_${RECEIVER_WEIGHT_MODE}"
+fi
 ANSWER_FILE="${ANSWERS_DIR}/${EXP_NAME}.jsonl"
 mkdir -p "${ANSWERS_DIR}"
 
-CUDA_VISIBLE_DEVICES=${GPU_ID} python -m FastV.src.FastV.inference.eval.inference \
-    --model-id "${CKPT}" \
-    --question-file "${DATASET_DIR}/gqa/llava_gqa_testdev_balanced.jsonl" \
-    --image-folder "${DATASET_DIR}/gqa/data/images" \
-    --answers-file ${ANSWER_FILE} \
-    --visual_token_num ${VISUAL_TOKEN_NUM} \
-    --use_fastv \
-    --fastv_k ${FASTV_K} \
-    --fastv_r ${FASTV_R} \
-    --image_token_start_index ${IMAGE_TOKEN_START_INDEX} \
-    --redistribution-strategy ${REDISTRIBUTION_STRATEGY} \
-    --redistribution-softmax-mode ${REDISTRIBUTION_SOFTMAX_MODE} \
-    --receiver-token-count ${RECEIVER_TOKEN_COUNT}
+# CUDA_VISIBLE_DEVICES=${GPU_ID} python -m FastV.src.FastV.inference.eval.inference \
+#     --model-id "${CKPT}" \
+#     --question-file "${DATASET_DIR}/gqa/llava_gqa_testdev_balanced.jsonl" \
+#     --image-folder "${DATASET_DIR}/gqa/data/images" \
+#     --answers-file ${ANSWER_FILE} \
+#     --visual_token_num ${VISUAL_TOKEN_NUM} \
+#     --use_fastv \
+#     --fastv_k ${FASTV_K} \
+#     --fastv_r ${FASTV_R} \
+#     --image_token_start_index ${IMAGE_TOKEN_START_INDEX} \
+#     --redistribution-strategy ${REDISTRIBUTION_STRATEGY} \
+#     --redistribution-softmax-mode ${REDISTRIBUTION_SOFTMAX_MODE} \
+#     --receiver-token-count ${RECEIVER_TOKEN_COUNT} \
+#     --receiver-weight-mode ${RECEIVER_WEIGHT_MODE} \
+#     --receiver-importance-source ${RECEIVER_IMPORTANCE_SOURCE}
 
-wait
+# wait
 
 EVAL_PREDICTIONS_FILE="${ANSWERS_DIR}/${EXP_NAME}.json"
-python3 /tmp2/danzel/attention-bias/scripts/convert_gqa_for_eval.py \
+python3 /tmp2/danzel/Sink_attention_redistribution/scripts/convert_gqa_for_eval.py \
 --src "$ANSWER_FILE" \
 --dst "$EVAL_PREDICTIONS_FILE"
 

@@ -14,9 +14,15 @@ from transformers import (
 )
 
 from cross_attention_sink_redistribution.attention_redistribution import (
-    REDISTRIBUTION_SOFTMAX_MODES,
+    RECEIVER_WEIGHT_MODES,
     REDISTRIBUTION_STRATEGIES,
+    _STRATEGY_ALIASES,
 )
+from efficiency import EfficiencyRecorder
+
+# argparse-facing strategy choices: canonical names plus the previous verbose aliases the
+# existing run scripts still pass (the redistributor normalizes aliases internally).
+REDISTRIBUTION_STRATEGY_CHOICES = tuple(REDISTRIBUTION_STRATEGIES) + tuple(_STRATEGY_ALIASES)
 
 ANSWER_SUFFIX = "\nAnswer the question using a single word or phrase."
 PROMPT_TEMPLATE = "USER: <image>\n{question}\nASSISTANT:"
@@ -127,6 +133,16 @@ def build_fastv_config(args):
         "sink_score_quantile": args.sink_score_quantile,
         # cross_attention_importants (cross_attention_sink_redistribution/cross_attention.py)
         "enable_sink_masked": args.enable_sink_masked,
+        # Cross-attention used ONLY to select receivers + weight the split (the redistributed mass
+        # is always the self-attention). Which cross-attention supplies that score: "cross" =
+        # in-decoder cross_attention_importants (real attention weights), "pre_visual" =
+        # pre_visual_cross_attention_importants (pre-decoder V_self features).
+        "receiver_importance_source": getattr(args, "receiver_importance_source", "pre_visual"),
+        # Selection and weighting can be sourced independently (each "cross" or "pre_visual"); each
+        # defaults to receiver_importance_source. The variant "select by pre-visual, weight by cross"
+        # is receiver_selection_source="pre_visual", receiver_weight_source="cross".
+        "receiver_selection_source": getattr(args, "receiver_selection_source", None),
+        "receiver_weight_source": getattr(args, "receiver_weight_source", None),
         "text_tokens_start_index": 0,
         "text_tokens_length": (
             args.text_tokens_length if args.text_tokens_length is not None else args.image_token_start_index
@@ -138,6 +154,9 @@ def build_fastv_config(args):
         "redistribution_softmax_mode": args.redistribution_softmax_mode,
         "receiver_token_count": args.receiver_token_count,
         "receiver_score_power": args.receiver_score_power,
+        # "cross" weights the sink-budget split by the cross-attention weight_scores; "uniform"
+        # splits it evenly (1/num_receivers), ablating the weighting while keeping the selection.
+        # "receiver_weight_mode": args.receiver_weight_mode,
     }
 
 
@@ -191,8 +210,28 @@ def eval_model(args):
         os.makedirs(answers_dir, exist_ok=True)
 
     model_id = args.model_id
+    recorder = EfficiencyRecorder.from_env(
+        model,
+        # --no-use-fastv drops fastv_config, so the stack runs unpruned: this family's vanilla row.
+        # receiver_token_count == 0 disables redistribution, leaving plain FastV.
+        method=(
+            "vanilla" if not args.use_fastv
+            else ("fastv-cross" if args.receiver_token_count else "fastv")
+        ),
+        config={
+            "use_fastv": args.use_fastv,
+            "fastv_k": args.fastv_k,
+            "fastv_r": args.fastv_r,
+            "visual_token_num": args.visual_token_num,
+            "redistribution_strategy": args.redistribution_strategy,
+            "receiver_token_count": args.receiver_token_count,
+            "receiver_importance_source": args.receiver_importance_source,
+        },
+    )
     with open(answers_file, "w") as ans_file:
         for line in tqdm(questions):
+            if recorder.should_stop():
+                break
             idx = line["question_id"]
             cur_prompt = line["text"]
             image_path = resolve_image_path(args.image_folder, line["image"])
@@ -221,7 +260,8 @@ def eval_model(args):
             if stopping_criteria is not None:
                 gen_kwargs["stopping_criteria"] = stopping_criteria
 
-            output = model.generate(**inputs, **gen_kwargs)
+            with recorder.sample(question_id=idx):
+                output = model.generate(**inputs, **gen_kwargs)
             decoded = processor.batch_decode(
                 output.sequences,
                 skip_special_tokens=True,
@@ -245,6 +285,7 @@ def eval_model(args):
             ans_file.flush()
             # break
         ans_file.close()
+    recorder.close()
 
 
 if __name__ == "__main__":
@@ -263,6 +304,12 @@ if __name__ == "__main__":
     parser.add_argument("--min_new_tokens", type=int, default=0)
     parser.add_argument("--visual_token_num", type=int, default=128)
     parser.add_argument("--use_fastv", action="store_true", dest="use_fastv")
+    # `--use_fastv` is store_true and set_defaults() forces it True, so nothing could reach the
+    # vanilla branch that build_fastv_config()/modeling_llava.py already implement (fastv_config
+    # None -> stock language_model forward). This is the off switch: it gives an unpruned baseline
+    # on the identical codebase, weights and attention implementation, so a FastV-vs-vanilla
+    # speedup isolates pruning instead of measuring eager attention.
+    parser.add_argument("--no-use-fastv", action="store_false", dest="use_fastv")
     parser.add_argument("--fastv_k", type=int, default=5)
     parser.add_argument("--fastv_r", type=float, default=0.75)
     parser.add_argument("--image_token_start_index", type=int, default=5)
@@ -298,16 +345,36 @@ if __name__ == "__main__":
         "--redistribution-strategy",
         type=str,
         default="topk_text_visual_tokens",
-        choices=REDISTRIBUTION_STRATEGIES,
+        choices=REDISTRIBUTION_STRATEGY_CHOICES,
     )
+    # Deprecated / ignored: the faithful redistributor always log-softmax-renormalizes each row.
+    # Kept so existing scripts that still pass --redistribution-softmax-mode don't error.
     parser.add_argument(
         "--redistribution-softmax-mode",
         type=str,
         default="post_softmax",
-        choices=REDISTRIBUTION_SOFTMAX_MODES,
     )
     parser.add_argument("--receiver-token-count", type=int, default=0)
     parser.add_argument("--receiver-score-power", type=float, default=1.0)
+    # How the freed sink budget splits among the chosen receivers. "cross" (default) weights the
+    # split by the cross-attention score; "uniform" gives each receiver 1/num_receivers, isolating
+    # the contribution of cross-attention *selection* from cross-attention *weighting*.
+    parser.add_argument(
+        "--receiver-weight-mode", type=str, default="cross", choices=RECEIVER_WEIGHT_MODES
+    )
+    # cross-attention that selects receivers + weights the split (mass is always self-attention)
+    parser.add_argument(
+        "--receiver-importance-source", type=str, default="cross", choices=("cross", "pre_visual")
+    )
+    # Optionally source selection and weighting independently; each defaults (None) to
+    # --receiver-importance-source. Variant: --receiver-selection-source pre_visual
+    # --receiver-weight-source cross (pick receivers by pre-visual, split budget by in-decoder cross).
+    parser.add_argument(
+        "--receiver-selection-source", type=str, default=None, choices=("cross", "pre_visual")
+    )
+    parser.add_argument(
+        "--receiver-weight-source", type=str, default=None, choices=("cross", "pre_visual")
+    )
     parser.set_defaults(use_fastv=True, use_cache=True, stop_on_user=True, enable_sink_masked=True)
     args = parser.parse_args()
 

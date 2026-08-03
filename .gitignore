@@ -2,3 +2,5 @@ answers/
 __pycache__/**
 *.pyc
 *.pt
+
+output/

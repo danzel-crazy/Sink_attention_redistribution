@@ -16,7 +16,7 @@ RETAIN_TOKENS=$(python -c "print(round(${VISUAL_TOKEN_NUM} * (1 - ${FASTV_R})))"
 
 REDISTRIBUTION_STRATEGY=${REDISTRIBUTION_STRATEGY:="topk_text_visual_tokens"}
 REDISTRIBUTION_SOFTMAX_MODE=${REDISTRIBUTION_SOFTMAX_MODE:="resoftmax"}
-RECEIVER_TOKEN_COUNT=${RECEIVER_TOKEN_COUNT:=8}
+RECEIVER_TOKEN_COUNT=${RECEIVER_TOKEN_COUNT:=32}
 
 ANSWER_ROOT="/project/aimm/danzel/experiment/sink_masked/fastv"
 ANSWERS_DIR="${ANSWER_ROOT}/MME/answers/cross_attention"
@@ -43,6 +43,6 @@ python scripts/convert_answer_to_mme_filename.py \
     --answer_file $ANSWER_FILE \
     --experiment "cross_attention"
 
-cd /tmp2/danzel/attention-bias/eval/mme/eval_tool
+cd /tmp2/danzel/Sink_attention_redistribution/eval/mme/eval_tool
 
 python calculation.py --results_dir "answers/cross_attention"

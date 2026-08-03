@@ -53,6 +53,7 @@ from .configuration_llama import LlamaConfig
 
 from cross_attention_sink_redistribution.sink_tokens import sink_token_selector
 from cross_attention_sink_redistribution.cross_attention import cross_attention_importants
+from cross_attention_sink_redistribution.pre_visual_cross_attention import pre_visual_cross_attention_importants
 from cross_attention_sink_redistribution.attention_redistribution import sink_attention_redistributor
 
 
@@ -973,8 +974,78 @@ class LlamaModel(LlamaPreTrainedModel):
         pipeline_args = SimpleNamespace(**fastv_config)
         self.sink_selector = sink_token_selector(pipeline_args)
         self.cross_attention_importants = cross_attention_importants(pipeline_args, sink_selector=self.sink_selector)
+        # pre-decoder variant: keys the cross-attention on the projected image features before the
+        # decoder (with one visual self-attention pass) instead of the in-decoder hidden states.
+        self.pre_visual_cross_attention_importants = pre_visual_cross_attention_importants(
+            pipeline_args, sink_selector=self.sink_selector
+        )
+        # Cross-attention is used ONLY to select which non-sink visual tokens receive the freed
+        # sink budget and to weight the split - never as attention mass (the mass is always the
+        # self-attention `last_layer_attention_avg_last_tok_image`). This picks which cross-attention
+        # supplies that receiver-ranking score: "pre_visual" = pre_visual_cross_attention_importants
+        # (V_self features), "cross" = cross_attention_importants (real in-decoder attention weights).
+        self.receiver_importance_source = getattr(pipeline_args, "receiver_importance_source", "pre_visual")
+        if self.receiver_importance_source not in ("cross", "pre_visual"):
+            raise ValueError(
+                f"receiver_importance_source must be 'cross' or 'pre_visual', got {self.receiver_importance_source!r}"
+            )
+        # The two cross-attention roles can be sourced independently: `receiver_selection_source`
+        # picks which non-sink visual tokens receive the freed budget, `receiver_weight_source`
+        # weights how that budget splits among them. Each defaults to receiver_importance_source, so
+        # setting only the single knob keeps the original single-source behavior; the requested
+        # variant is selection="pre_visual", weight="cross".
+        _selection_source = getattr(pipeline_args, "receiver_selection_source", None)
+        _weight_source = getattr(pipeline_args, "receiver_weight_source", None)
+        self.receiver_selection_source = (
+            _selection_source if _selection_source is not None else self.receiver_importance_source
+        )
+        self.receiver_weight_source = (
+            _weight_source if _weight_source is not None else self.receiver_importance_source
+        )
+        for _name, _value in (
+            ("receiver_selection_source", self.receiver_selection_source),
+            ("receiver_weight_source", self.receiver_weight_source),
+        ):
+            if _value not in ("cross", "pre_visual"):
+                raise ValueError(f"{_name} must be 'cross' or 'pre_visual', got {_value!r}")
         self.sink_attention_redistributor = sink_attention_redistributor(pipeline_args)
         self._fastv_pipeline_config = fastv_config
+
+    def _receiver_cross_scores(self, *, hidden_states, inputs_embeds, last_layer_attention, img_start, img_len, seq_len):
+        """Cross-attention importance over the visual tokens ([N]) for the two redistribution roles.
+        Returns (selection_scores, weight_scores): `selection_scores` (from receiver_selection_source)
+        ranks which receivers get the freed budget; `weight_scores` (from receiver_weight_source)
+        splits it among them. Each source is computed at most once even if both roles share it. Does
+        NOT touch the pruning/selection flow - it only returns scores."""
+        question_start = img_start + img_len
+        question_length = seq_len - question_start
+        computed = {}
+
+        def score_for(source):
+            if source in computed:
+                return computed[source]
+            if source == "cross":
+                self.cross_attention_importants.compute_cross_attention(
+                    last_layer_attention,
+                    torch.arange(question_start, seq_len, device=last_layer_attention.device),
+                    visual_token_start=img_start,
+                    visual_token_num=img_len,
+                    sink_local_ids=None,
+                )
+                scores = self.cross_attention_importants.important_tokens_scores_raw  # [N]
+            else:  # pre_visual
+                self.pre_visual_cross_attention_importants.compute_cross_attention(
+                    hidden_states,
+                    inputs_embeds,
+                    text_tokens_start_index=question_start,
+                    text_tokens_length=question_length,
+                    sink_local_ids=None,
+                )
+                scores = self.pre_visual_cross_attention_importants.important_tokens_scores_raw  # [N]
+            computed[source] = scores
+            return scores
+
+        return score_for(self.receiver_selection_source), score_for(self.receiver_weight_source)
 
     def fastv_forward(
         self,
@@ -1062,7 +1133,6 @@ class LlamaModel(LlamaPreTrainedModel):
 
                     elif layer_idx==FASTV_k:
                         # compute pruned tokens, generate fastv sign
-                        sink_ids = self.sink_selector._select_sink_tokens(hidden_states[0][FASTV_image_token_start_index:FASTV_image_token_start_index+FASTV_image_token_length])
                         last_layer_attention = layer_outputs[1]
                         # compute average attention over different head
                         last_layer_attention_avg = torch.mean(last_layer_attention, dim=1)[0]
@@ -1070,27 +1140,27 @@ class LlamaModel(LlamaPreTrainedModel):
                         last_layer_attention_avg_last_tok = last_layer_attention_avg[-1]
                         # get the attention in image token
                         last_layer_attention_avg_last_tok_image = last_layer_attention_avg_last_tok[FASTV_image_token_start_index:FASTV_image_token_start_index+FASTV_image_token_length]
-                        # cross-attention importance (query = the actual question tokens after the
-                        # image block, not the static system prompt) - used only to pick receivers
-                        # and weight them, NOT as the redistributed mass itself. sink_ids is passed
-                        # in so both this and the redistributor share one sink membership decision
-                        # instead of each recomputing it independently
-                        question_start = FASTV_image_token_start_index + FASTV_image_token_length
-                        question_length = seq_length_with_past - question_start
-                        self.cross_attention_importants.compute_cross_attention(
-                            hidden_states,
-                            text_tokens_start_index=question_start,
-                            text_tokens_length=question_length,
-                            sink_local_ids=sink_ids,
-                        )
-                        image_attention = self.cross_attention_importants.important_tokens_scores_raw
-                        # compute sink budget - always from self-attention, the actual mass being redistributed
-                        sink_budget = last_layer_attention_avg_last_tok_image[sink_ids].sum()
-                        new_image_attention = self.sink_attention_redistributor.redistribute(
-                            last_layer_attention_avg_last_tok_image, image_attention, sink_ids, sink_budget
-                        )
+                        # ===== sink attention redistribution: move sink self-attention onto cross-selected receivers =====
+                        # sink tokens (RMS), local to the visual block
+                        sink_ids = self.sink_selector._select_sink_tokens(hidden_states[0][FASTV_image_token_start_index:FASTV_image_token_start_index+FASTV_image_token_length])
+                        print(f"sink ids: {sink_ids}")
+                        if sink_ids.numel() > 0:
+                            # cross-attention importance over visual tokens: selection ranks receivers,
+                            # weight splits the freed budget (may be two different cross-attention sources)
+                            selection_scores, weight_scores = self._receiver_cross_scores(
+                                hidden_states=hidden_states, inputs_embeds=inputs_embeds,
+                                last_layer_attention=last_layer_attention,
+                                img_start=FASTV_image_token_start_index, img_len=FASTV_image_token_length,
+                                seq_len=seq_length_with_past,
+                            )
+                            # redistribute the sinks' self-attention budget; all magnitudes stay self-attention
+                            sink_budget = last_layer_attention_avg_last_tok_image[sink_ids].sum()
+                            last_layer_attention_avg_last_tok_image = self.sink_attention_redistributor.redistribute(
+                                last_layer_attention_avg_last_tok_image, selection_scores, sink_ids, sink_budget,
+                                weight_scores=weight_scores)
+                        # ===============================================================================================
                         # get the indexs of the top ATTENTION_RANK tokens
-                        top_attention_rank_index = new_image_attention.topk(round(FASTV_image_token_length*(1-FASTV_r))).indices + FASTV_image_token_start_index
+                        top_attention_rank_index = last_layer_attention_avg_last_tok_image.topk(round(FASTV_image_token_length*(1-FASTV_r))).indices + FASTV_image_token_start_index
                         # keep index
                         keep_indexs = torch.cat( (torch.arange(FASTV_image_token_start_index,device=device), top_attention_rank_index, torch.arange(FASTV_image_token_start_index+FASTV_image_token_length,seq_length_with_past,device=device)))
                         # sort index
@@ -1098,7 +1168,7 @@ class LlamaModel(LlamaPreTrainedModel):
                         # update seq length
                         new_seq_length = keep_indexs.shape[0]
                         # filter hidden states
-                        hidden_states = hidden_states[:,keep_indexs,:] 
+                        hidden_states = hidden_states[:,keep_indexs,:]
                         # update position ids
                         position_ids = keep_indexs.unsqueeze(0)
                         # update attention mask
@@ -1116,7 +1186,6 @@ class LlamaModel(LlamaPreTrainedModel):
 
                 elif layer_idx==FASTV_k:
                     # compute pruned tokens, generate fastv sign
-                    sink_ids = self.sink_selector._select_sink_tokens(hidden_states[0][FASTV_image_token_start_index:FASTV_image_token_start_index+FASTV_image_token_length])
                     last_layer_attention = layer_outputs[1]
                     # compute average attention over different head
                     last_layer_attention_avg = torch.mean(last_layer_attention, dim=1)[0]
@@ -1124,24 +1193,26 @@ class LlamaModel(LlamaPreTrainedModel):
                     last_layer_attention_avg_last_tok = last_layer_attention_avg[-1]
                     # get the attention in image token
                     last_layer_attention_avg_last_tok_image = last_layer_attention_avg_last_tok[FASTV_image_token_start_index:FASTV_image_token_start_index+FASTV_image_token_length]
-                    # cross-attention-based importance (query = the actual question tokens after
-                    # the image block, not the static system prompt) replaces self-attention as
-                    # the redistribution input; sink_ids is passed in so both share one sink
-                    # membership decision instead of each recomputing it independently
-                    question_start = FASTV_image_token_start_index + FASTV_image_token_length
-                    question_length = seq_length_with_past - question_start
-                    self.cross_attention_importants.compute_cross_attention(
-                        hidden_states,
-                        text_tokens_start_index=question_start,
-                        text_tokens_length=question_length,
-                        sink_local_ids=sink_ids,
-                    )
-                    image_attention = self.cross_attention_importants.important_tokens_scores_raw
-                    # compute sink budget
-                    sink_budget = last_layer_attention_avg_last_tok_image[sink_ids].sum()
-                    new_image_attention = self.sink_attention_redistributor.redistribute(last_layer_attention_avg_last_tok_image, image_attention, sink_ids, sink_budget)
+                    # ===== sink attention redistribution: move sink self-attention onto cross-selected receivers =====
+                    # sink tokens (RMS), local to the visual block
+                    sink_ids = self.sink_selector._select_sink_tokens(hidden_states[0][FASTV_image_token_start_index:FASTV_image_token_start_index+FASTV_image_token_length])
+                    if sink_ids.numel() > 0:
+                        # cross-attention importance over visual tokens: selection ranks receivers,
+                        # weight splits the freed budget (may be two different cross-attention sources)
+                        selection_scores, weight_scores = self._receiver_cross_scores(
+                            hidden_states=hidden_states, inputs_embeds=inputs_embeds,
+                            last_layer_attention=last_layer_attention,
+                            img_start=FASTV_image_token_start_index, img_len=FASTV_image_token_length,
+                            seq_len=seq_length_with_past,
+                        )
+                        # redistribute the sinks' self-attention budget; all magnitudes stay self-attention
+                        sink_budget = last_layer_attention_avg_last_tok_image[sink_ids].sum()
+                        last_layer_attention_avg_last_tok_image = self.sink_attention_redistributor.redistribute(
+                            last_layer_attention_avg_last_tok_image, selection_scores, sink_ids, sink_budget,
+                            weight_scores=weight_scores)
+                    # ===============================================================================================
                     # get the indexs of the top ATTENTION_RANK tokens
-                    top_attention_rank_index = new_image_attention.topk(round(FASTV_image_token_length*(1-FASTV_r))).indices + FASTV_image_token_start_index
+                    top_attention_rank_index = last_layer_attention_avg_last_tok_image.topk(round(FASTV_image_token_length*(1-FASTV_r))).indices + FASTV_image_token_start_index
                     # keep index
                     keep_indexs = torch.cat( (torch.arange(FASTV_image_token_start_index,device=device), top_attention_rank_index, torch.arange(FASTV_image_token_start_index+FASTV_image_token_length,seq_length_with_past,device=device)))
                     # sort index
@@ -1159,7 +1230,7 @@ class LlamaModel(LlamaPreTrainedModel):
                         None, hidden_states, 0
                     )
 
-                    cache_position = cache_position[:new_seq_length]     
+                    cache_position = cache_position[:new_seq_length]
                 
 
 

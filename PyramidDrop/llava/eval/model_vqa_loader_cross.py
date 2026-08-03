@@ -12,11 +12,13 @@ from llava.utils import disable_torch_init
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
 from torch.utils.data import Dataset, DataLoader
 
+from efficiency import EfficiencyRecorder
 from cross_attention_sink_redistribution_llava.sink_tokens import sink_token_selector
 from cross_attention_sink_redistribution_llava.cross_attention import cross_attention_importants
 from cross_attention_sink_redistribution_llava.attention_redistribution import (
+    RECEIVER_WEIGHT_MODES,
     REDISTRIBUTION_SOFTMAX_MODES,
-    REDISTRIBUTION_STRATEGIES,
+    REDISTRIBUTION_STRATEGY_CHOICES,
     sink_attention_redistributor,
 )
 
@@ -123,13 +125,27 @@ def eval_model(args):
 
     data_loader = create_data_loader(questions, args.image_folder, tokenizer, image_processor, model.config)
 
+    recorder = EfficiencyRecorder.from_env(
+        model,
+        method="pdrop-cross",
+        config={
+            "layer_list": args.layer_list,
+            "image_token_ratio_list": args.image_token_ratio_list,
+            "redistribution_strategy": getattr(args, "redistribution_strategy", None),
+            "redistribution_softmax_mode": getattr(args, "redistribution_softmax_mode", None),
+            "redistribution_ratio": getattr(args, "redistribution_ratio", None),
+            "receiver_token_count": getattr(args, "receiver_token_count", None),
+        },
+    )
     for (input_ids, image_tensor, image_sizes), line in tqdm(zip(data_loader, questions), total=len(questions)):
+        if recorder.should_stop():
+            break
         idx = line["question_id"]
         cur_prompt = line["text"]
 
         input_ids = input_ids.to(device='cuda', non_blocking=True)
 
-        with torch.inference_mode():
+        with torch.inference_mode(), recorder.sample(question_id=idx):
             output_ids = model.generate(
                 input_ids,
                 images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
@@ -152,6 +168,7 @@ def eval_model(args):
                                    "metadata": {}}) + "\n")
         # ans_file.flush()
     ans_file.close()
+    recorder.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -182,10 +199,12 @@ if __name__ == "__main__":
 
     # sink_attention_redistributor (cross_attention_sink_redistribution_llava/attention_redistribution.py)
     parser.add_argument("--redistribution_ratio", type=float, default=1.0)
-    parser.add_argument("--redistribution_strategy", type=str, default="topk_text_visual_tokens", choices=REDISTRIBUTION_STRATEGIES)
+    parser.add_argument("--redistribution_strategy", type=str, default="topk_text_visual_tokens", choices=REDISTRIBUTION_STRATEGY_CHOICES)
+    # accepted but ignored - see the back-compat note in attention_redistribution.py
     parser.add_argument("--redistribution_softmax_mode", type=str, default="post_softmax", choices=REDISTRIBUTION_SOFTMAX_MODES)
     parser.add_argument("--receiver_token_count", type=int, default=0)
     parser.add_argument("--receiver_score_power", type=float, default=1.0)
+    parser.add_argument("--receiver_weight_mode", type=str, default="cross", choices=RECEIVER_WEIGHT_MODES)
     parser.set_defaults(enable_sink_masked=True)
 
     args = parser.parse_args()

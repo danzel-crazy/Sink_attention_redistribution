@@ -50,7 +50,7 @@ if __name__ == "__main__":
     experiment = args.experiment
     print(f"Processing experiment: {experiment}")
 
-    result_dir = os.path.join('/tmp2/danzel/attention-bias/eval/mme/eval_tool', 'answers', experiment)
+    result_dir = os.path.join('/tmp2/danzel/Sink_attention_redistribution/eval/mme/eval_tool', 'answers', experiment)
     os.makedirs(result_dir, exist_ok=True)
 
     if args.answer_file:

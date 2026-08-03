@@ -20,8 +20,9 @@ from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 
 from cross_attention_sink_redistribution_llava.attention_redistribution import (
+    RECEIVER_WEIGHT_MODES,
     REDISTRIBUTION_SOFTMAX_MODES,
-    REDISTRIBUTION_STRATEGIES,
+    REDISTRIBUTION_STRATEGY_CHOICES,
     sink_attention_redistributor,
 )
 from cross_attention_sink_redistribution_llava.cross_attention import cross_attention_importants
@@ -161,8 +162,9 @@ if __name__ == "__main__":
         "--redistribution_strategy",
         type=str,
         default="topk_text_visual_tokens",
-        choices=REDISTRIBUTION_STRATEGIES,
+        choices=REDISTRIBUTION_STRATEGY_CHOICES,
     )
+    # accepted but ignored - see the back-compat note in attention_redistribution.py
     parser.add_argument(
         "--redistribution_softmax_mode",
         type=str,
@@ -171,6 +173,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--receiver_token_count", type=int, default=0)
     parser.add_argument("--receiver_score_power", type=float, default=1.0)
+    parser.add_argument("--receiver_weight_mode", type=str, default="cross", choices=RECEIVER_WEIGHT_MODES)
     parser.set_defaults(enable_sink_masked=True)
 
     args = parser.parse_args()

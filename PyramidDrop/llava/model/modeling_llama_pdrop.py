@@ -1426,15 +1426,26 @@ class LlamaModel(LlamaPreTrainedModel):
                 # current-stage visual-token span) only decides who receives it and how much.
                 sink_ids = self.sink_selector._select_sink_tokens(features[i][image_index:image_index+image_tokens[i]])
 
+                # Cross-attention from the *real* post-RoPE Q/K of this layer, over ALL question
+                # tokens - not the single last-instruction row used for attention_avg_text above.
+                # Reusing that one row would make the cross-attention identical to the
+                # self-attention it is supposed to rank receivers independently of. The Q/K are
+                # already materialized for the whole sequence, so this adds only a [H, T, N] matmul.
+                # from_qk (rather than the post-softmax-weights entry point) keeps the
+                # attention_avg_text path above untouched and needs no causal mask: every visual
+                # key precedes every question query, so the mask is all-zeros over this span.
                 question_start = image_index + image_tokens[i]
                 question_length = int(valid_lengths[i].item()) - question_start
-                self.cross_attention_importants.compute_cross_attention(
-                    features[i].unsqueeze(0),
-                    text_tokens_start_index=question_start,
-                    text_tokens_length=question_length,
+                question_positions = torch.arange(
+                    question_start, question_start + question_length, device=cur_query_states.device
+                )
+                self.cross_attention_importants.compute_cross_attention_from_qk(
+                    cur_query_states.unsqueeze(0),
+                    cur_key_states.unsqueeze(0),
+                    question_positions,
+                    visual_token_start=image_index,
+                    visual_token_num=image_tokens[i],
                     sink_local_ids=sink_ids,
-                    visual_tokens_start_index=image_index,
-                    visual_tokens_length=image_tokens[i],
                 )
                 cross_attention_importance = self.cross_attention_importants.important_tokens_scores_raw
 

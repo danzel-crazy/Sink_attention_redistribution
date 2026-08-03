@@ -14,6 +14,10 @@ from torch.utils.data import Dataset, DataLoader
 
 from PIL import Image
 import math
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
+from efficiency import EfficiencyRecorder
 
 
 def split_list(lst, n):
@@ -107,13 +111,25 @@ def eval_model(args):
 
     data_loader = create_data_loader(questions, args.image_folder, tokenizer, image_processor, model.config)
 
+    recorder = EfficiencyRecorder.from_env(
+        model,
+        # without --layer_list this loader runs stock LLaVA, which is the vanilla baseline row
+        # every reduction ratio and speedup in the table is measured against
+        method="pdrop" if args.layer_list is not None else "vanilla",
+        config={
+            "layer_list": args.layer_list,
+            "image_token_ratio_list": args.image_token_ratio_list,
+        },
+    )
     for (input_ids, image_tensor, image_sizes), line in tqdm(zip(data_loader, questions), total=len(questions)):
+        if recorder.should_stop():
+            break
         idx = line["question_id"]
         cur_prompt = line["text"]
 
         input_ids = input_ids.to(device='cuda', non_blocking=True)
 
-        with torch.inference_mode():
+        with torch.inference_mode(), recorder.sample(question_id=idx):
             output_ids = model.generate(
                 input_ids,
                 images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
@@ -136,6 +152,7 @@ def eval_model(args):
                                    "metadata": {}}) + "\n")
         # ans_file.flush()
     ans_file.close()
+    recorder.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -12,6 +12,7 @@ from llava.utils import disable_torch_init
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
 from torch.utils.data import Dataset, DataLoader
 
+from efficiency import EfficiencyRecorder
 from cross_attention_sink_redistribution_llava_sparsevlm.sink_tokens import sink_token_selector
 from cross_attention_sink_redistribution_llava_sparsevlm.cross_attention import cross_attention_importants
 from cross_attention_sink_redistribution_llava_sparsevlm.attention_redistribution import (
@@ -112,12 +113,26 @@ def eval_model(args):
     data_loader = create_data_loader(questions, args.image_folder, tokenizer, image_processor, model.config)
 
     retained_tokens = args.retained_tokens
+    recorder = EfficiencyRecorder.from_env(
+        model,
+        method="sparsevlm-cross",
+        config={
+            "retained_tokens": retained_tokens,
+            "redistribution_strategy": args.redistribution_strategy,
+            "redistribution_softmax_mode": args.redistribution_softmax_mode,
+            "redistribution_ratio": args.redistribution_ratio,
+            "receiver_token_count": args.receiver_token_count,
+            "enable_sink_masked": args.enable_sink_masked,
+        },
+    )
     for (input_ids, image_tensor, image_sizes), line in tqdm(zip(data_loader, questions), total=len(questions)):
+        if recorder.should_stop():
+            break
         idx = line["question_id"]
         cur_prompt = line["text"]
 
         input_ids = input_ids.to(device='cuda', non_blocking=True)
-        with torch.inference_mode():
+        with torch.inference_mode(), recorder.sample(question_id=idx):
             output_ids = model.generate(
                 input_ids,
                 images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
@@ -140,6 +155,7 @@ def eval_model(args):
                                    "metadata": {}}) + "\n")
         # ans_file.flush()
     ans_file.close()
+    recorder.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
